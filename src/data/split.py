@@ -109,14 +109,13 @@ def _extract_ground_truth_labels(suffix_events: pl.LazyFrame) -> pl.LazyFrame:
 def run_split(config: dict[str, Any], mode: str = "sample") -> None:
     """Generate leak-free temporal train/validation splits and ground-truth labels.
 
-    In `sample` mode with `history_corpus_frac: 1.0`, 100% of historical `train`
-    events (`ts < cutoff_ts`) are preserved so the 1.85M-item co-visitation graph
-    has full density, while validation and test query sessions are subsampled at
-    `sample_frac` (5%) for rapid, representative local Recall@20 evaluation.
-
-    Args:
-        config: Loaded pipeline configuration with resolved Drive paths.
-        mode: Execution mode ('sample' or 'full').
+    Mirrors the exact Kaggle OTTO test setup:
+      - All historical events (`ts < cutoff_ts`) PLUS the strictly observed prefixes
+        (`_row_idx < _split_idx`) of validation-window sessions form the observed
+        interaction corpus (`train.parquet`), while 100% of held-out suffixes
+        (`_row_idx >= _split_idx`) are strictly withheld from the corpus.
+      - Query validation sessions (`history.parquet`, `labels.parquet`) are sampled
+        at `sample_frac` (5% in `sample` mode, up to `max_val_sessions` in `full`).
     """
     raw_dir = Path(config["paths"]["raw_data"])
     sample_dir = Path(config["paths"]["sample_data"])
@@ -127,10 +126,9 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
     history_corpus_frac = float(mode_cfg.get("history_corpus_frac", 1.0))
     sample_frac = float(config["sample_frac"])
     val_days = int(config["pipeline"]["validation_days"])
-    max_val_sessions = int(config["pipeline"].get("max_val_sessions", 350_000))
+    max_val_sessions = int(config["pipeline"].get("max_val_sessions", 300_000))
     seed = int(config["pipeline"]["seed"])
 
-    # Prefer raw_data when keeping 100% historical item graph in sample mode
     use_raw_for_history = (
         mode == "full"
         or (history_corpus_frac >= 1.0 and any(raw_dir.rglob("*.parquet")))
@@ -183,14 +181,8 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
     history_path = out_dir / "history.parquet"
     labels_path = out_dir / "labels.parquet"
 
-    # 1. Historical corpus strictly before validation cutoff (zero future leakage)
-    hist_corpus = events.filter(pl.col("ts") < cutoff_ts)
-    if history_corpus_frac < 1.0 and use_raw_for_history:
-        hist_corpus = hist_corpus.filter(_session_sample_expr(history_corpus_frac, seed))
-    hist_corpus.sink_parquet(train_path)
-
-    # 2. Validation sessions: strictly starting in [cutoff_ts, max_ts] when available
-    strict_val_sessions = (
+    # Identify all sessions starting in the validation window with >= 2 events
+    strict_val_sessions_df = (
         events.group_by("session")
         .agg(
             pl.col("ts").min().alias("_s_min"),
@@ -198,17 +190,10 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
         )
         .filter((pl.col("_s_min") >= cutoff_ts) & (pl.col("_s_len") >= 2))
         .select("session")
+        .collect()
     )
-
-    if use_raw_for_history and sample_frac < 1.0:
-        strict_val_sessions = strict_val_sessions.filter(
-            _session_sample_expr(sample_frac, seed)
-        )
-
-    selected_val_sessions = strict_val_sessions.collect()
-    if len(selected_val_sessions) == 0:
-        # Fallback for synthetic datasets where sessions span across cutoff_ts
-        selected_val_sessions = (
+    if len(strict_val_sessions_df) == 0:
+        strict_val_sessions_df = (
             events.filter(pl.col("ts") >= cutoff_ts)
             .group_by("session")
             .len()
@@ -217,19 +202,10 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
             .collect()
         )
 
-    if len(selected_val_sessions) > max_val_sessions:
-        selected_val_sessions = selected_val_sessions.sample(
-            n=max_val_sessions, seed=seed
-        )
-
-    logger.info(
-        "[split] Selected %d validation sessions for history/label truncation.",
-        len(selected_val_sessions),
-    )
-
-    val_events = (
+    # Deterministically truncate ALL validation-window sessions into observed prefix vs held-out suffix
+    all_val_truncated = (
         events.filter(pl.col("ts") >= cutoff_ts)
-        .join(selected_val_sessions.lazy(), on="session", how="semi")
+        .join(strict_val_sessions_df.lazy(), on="session", how="semi")
         .sort(["session", "ts"])
         .with_columns(
             pl.len().over("session").alias("_sess_len"),
@@ -247,16 +223,48 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
         )
     )
 
-    val_events.filter(pl.col("_row_idx") < pl.col("_split_idx")).select(
+    # Select query validation sessions (5% in sample mode, capped in full mode)
+    query_val_sessions = strict_val_sessions_df
+    if use_raw_for_history and sample_frac < 1.0:
+        query_val_sessions = query_val_sessions.filter(
+            _session_sample_expr(sample_frac, seed)
+        )
+    if len(query_val_sessions) > max_val_sessions:
+        query_val_sessions = query_val_sessions.sample(n=max_val_sessions, seed=seed)
+
+    logger.info(
+        "[split] Selected %d/%d validation query sessions (100%% suffixes held out).",
+        len(query_val_sessions),
+        len(strict_val_sessions_df),
+    )
+
+    # Non-query validation sessions' observed prefixes join `train.parquet` (0 label leakage, mirrors Kaggle test.parquet!)
+    non_query_observed_prefixes = (
+        all_val_truncated.join(query_val_sessions.lazy(), on="session", how="anti")
+        .filter(pl.col("_row_idx") < pl.col("_split_idx"))
+        .select("session", "aid", "ts", "type")
+    )
+
+    hist_corpus = events.filter(pl.col("ts") < cutoff_ts)
+    if history_corpus_frac < 1.0 and use_raw_for_history:
+        hist_corpus = hist_corpus.filter(_session_sample_expr(history_corpus_frac, seed))
+
+    pl.concat([hist_corpus, non_query_observed_prefixes]).sink_parquet(train_path)
+
+    # Query validation sessions -> history.parquet (observed prefix) & labels.parquet (held-out suffix)
+    query_val_events = all_val_truncated.join(
+        query_val_sessions.lazy(), on="session", how="semi"
+    )
+    query_val_events.filter(pl.col("_row_idx") < pl.col("_split_idx")).select(
         "session", "aid", "ts", "type"
     ).sink_parquet(history_path)
 
-    suffix_events = val_events.filter(pl.col("_row_idx") >= pl.col("_split_idx")).select(
-        "session", "aid", "ts", "type"
-    )
+    suffix_events = query_val_events.filter(
+        pl.col("_row_idx") >= pl.col("_split_idx")
+    ).select("session", "aid", "ts", "type")
     _extract_ground_truth_labels(suffix_events).sink_parquet(labels_path)
 
-    # 3. Kaggle test events
+    # Kaggle test events
     if test_files:
         test_out = out_dir / "test_history.parquet"
         test_lf = _normalize_events(test_files)
@@ -270,4 +278,4 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
             test_source_dir,
         )
 
-    logger.info("[split] Completed splits in '%s'.", out_dir)
+    logger.info("[split] Completed leak-free splits in '%s'.", out_dir)
