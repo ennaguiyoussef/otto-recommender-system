@@ -60,9 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage",
         type=str,
-        choices=["all", *PIPELINE_ORDER],
         default="all",
-        help="Pipeline stage to execute, or 'all' to run end-to-end.",
+        help="Pipeline stage ('all', single stage, or comma-separated e.g. 'candidates,features,train,predict').",
     )
     parser.add_argument(
         "--config",
@@ -87,7 +86,15 @@ def main() -> None:
     )
 
     config = load_config(config_path=args.config, mode=args.mode, create_dirs=True)
-    stages_to_run = PIPELINE_ORDER if args.stage == "all" else [args.stage]
+    if args.stage == "all":
+        stages_to_run = PIPELINE_ORDER
+    else:
+        stages_to_run = [s.strip() for s in args.stage.split(",") if s.strip()]
+        invalid = [s for s in stages_to_run if s not in STAGE_REGISTRY]
+        if invalid:
+            raise ValueError(
+                f"Invalid stage(s) {invalid}. Choose from {['all', *PIPELINE_ORDER]}."
+            )
 
     pipeline_start = time.perf_counter()
     for stage_name in stages_to_run:
