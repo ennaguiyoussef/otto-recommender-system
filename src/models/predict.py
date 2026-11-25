@@ -1,4 +1,4 @@
-"""LightGBM reranker inference and Kaggle submission generation."""
+"""Vectorized LightGBM + GPU XGBoost reranker inference and submission export."""
 
 from __future__ import annotations
 
@@ -11,22 +11,25 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
-from src.models.train import _load_fallback_by_event, _pad_predictions
+from src.models.train import (
+    _detect_cuda_gpu,
+    _load_fallback_by_event,
+    _pad_predictions_vectorized,
+    _zscore_per_session,
+)
+
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
-BATCH_SESSIONS = 100_000
+BATCH_SESSIONS = 150_000
 
 
 def run_predict(config: dict[str, Any], mode: str = "sample") -> None:
-    """Score test candidates with trained LightGBM models and write submission CSV.
-
-    Writes `<submissions>/submission_<mode>.csv` with columns `session_type,labels`.
-
-    Args:
-        config: Loaded pipeline configuration with resolved Drive paths.
-        mode: Execution mode ('sample' or 'full').
-    """
+    """Score test candidates with trained models and write Kaggle submission CSV."""
     features_dir = Path(config["paths"]["features"]) / mode
     candidates_dir = Path(config["paths"]["candidates"]) / mode
     models_dir = Path(config["paths"]["models"]) / mode
@@ -43,13 +46,25 @@ def run_predict(config: dict[str, Any], mode: str = "sample") -> None:
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     feature_cols: list[str] = meta["feature_cols"]
     event_types: list[str] = meta["event_types"]
+    blend_weights: dict[str, dict[str, float]] = meta.get("blend_weights", {})
+    use_xgb = bool(meta.get("xgb_enabled", False)) and (xgb is not None)
+    has_cuda = _detect_cuda_gpu()
 
-    boosters: dict[str, lgb.Booster] = {}
+    lgb_boosters: dict[str, lgb.Booster] = {}
+    xgb_boosters: dict[str, Any] = {}
+
     for event in event_types:
-        model_file = models_dir / f"lgbm_{event}.txt"
-        if not model_file.exists():
-            raise FileNotFoundError(f"Missing trained model file: {model_file}")
-        boosters[event] = lgb.Booster(model_file=str(model_file))
+        lgb_file = models_dir / f"lgbm_{event}.txt"
+        if not lgb_file.exists():
+            raise FileNotFoundError(f"Missing trained LightGBM model: {lgb_file}")
+        lgb_boosters[event] = lgb.Booster(model_file=str(lgb_file))
+
+        xgb_file = models_dir / f"xgb_{event}.json"
+        if use_xgb and xgb_file.exists() and xgb is not None:
+            booster = xgb.Booster()
+            booster.load_model(str(xgb_file))
+            booster.set_param({"device": "cuda" if has_cuda else "cpu"})
+            xgb_boosters[event] = booster
 
     test_features_path = features_dir / "test_features.parquet"
     val_features_path = features_dir / "features.parquet"
@@ -69,9 +84,11 @@ def run_predict(config: dict[str, Any], mode: str = "sample") -> None:
     out_csv = submissions_dir / f"submission_{mode}.csv"
 
     logger.info(
-        "[predict] Scoring '%s' with %d LightGBM models -> '%s'",
+        "[predict] Scoring '%s' (LightGBM=%d, XGBoost=%d, cuda=%s) -> '%s'",
         active_features_path,
-        len(boosters),
+        len(lgb_boosters),
+        len(xgb_boosters),
+        has_cuda,
         out_csv,
     )
 
@@ -81,8 +98,8 @@ def run_predict(config: dict[str, Any], mode: str = "sample") -> None:
     )
     total_sessions = len(all_sessions)
 
-    with out_csv.open("w", encoding="utf-8", newline="\n") as out_f:
-        out_f.write("session_type,labels\n")
+    with out_csv.open("wb") as out_f:
+        out_f.write(b"session_type,labels\n")
 
         for start in range(0, total_sessions, BATCH_SESSIONS):
             batch_sess = pl.Series(
@@ -91,6 +108,7 @@ def run_predict(config: dict[str, Any], mode: str = "sample") -> None:
             batch_df = (
                 lf.join(batch_sess.to_frame().lazy(), on="session", how="semi")
                 .select(["session", "aid", *feature_cols])
+                .sort("session")
                 .collect()
             )
             x_batch = (
@@ -102,15 +120,25 @@ def run_predict(config: dict[str, Any], mode: str = "sample") -> None:
             )
 
             sub_chunks: list[pl.DataFrame] = []
-            for event, booster in boosters.items():
-                scores = booster.predict(x_batch)
+            for event in event_types:
+                lgb_scores = lgb_boosters[event].predict(x_batch)
+                w = blend_weights.get(event, {"lgbm": 1.0, "xgb": 0.0})
+
+                if event in xgb_boosters and w.get("xgb", 0.0) > 0.0:
+                    xgb_scores = xgb_boosters[event].inplace_predict(x_batch)
+                    final_scores = float(w["lgbm"]) * _zscore_per_session(
+                        base_ids, lgb_scores
+                    ) + float(w["xgb"]) * _zscore_per_session(base_ids, xgb_scores)
+                else:
+                    final_scores = lgb_scores
+
                 ranked = (
-                    base_ids.with_columns(pl.Series("_score", scores, dtype=pl.Float64))
+                    base_ids.with_columns(pl.Series("_score", final_scores, dtype=pl.Float32))
                     .sort(["session", "_score"], descending=[False, True])
                     .group_by("session", maintain_order=True)
                     .agg(pl.col("aid").head(top_k_predict).alias("labels"))
                 )
-                ranked = _pad_predictions(
+                ranked = _pad_predictions_vectorized(
                     ranked, fallbacks.get(event, []), top_k_predict
                 )
                 formatted = ranked.select(
@@ -125,8 +153,7 @@ def run_predict(config: dict[str, Any], mode: str = "sample") -> None:
                 sub_chunks.append(formatted)
 
             merged_sub = pl.concat(sub_chunks).sort("session_type")
-            for session_type, label_str in merged_sub.iter_rows():
-                out_f.write(f"{session_type},{label_str}\n")
+            merged_sub.write_csv(out_f, include_header=False)
 
     logger.info(
         "[predict] Wrote %d submission rows (%d sessions x %d types) -> %s",
