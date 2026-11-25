@@ -40,13 +40,32 @@ def _detect_ts_per_sec(events: pl.LazyFrame) -> int:
     return 1000 if int(max_ts) > 10_000_000_000 else 1
 
 
+def _compact_edge_parts(parts: list[pl.DataFrame], keep_k: int) -> list[pl.DataFrame]:
+    """Merge accumulated bucket edge frames in-place to bound peak RAM."""
+    if len(parts) <= 1:
+        return parts
+    merged = (
+        pl.concat(parts)
+        .lazy()
+        .group_by(["source_aid", "aid"])
+        .agg(pl.col("score").sum().cast(pl.Float32).alias("score"))
+        .sort(["source_aid", "score"], descending=[False, True])
+        .group_by("source_aid", maintain_order=True)
+        .head(keep_k)
+        .collect()
+    )
+    parts.clear()
+    gc.collect()
+    return [merged]
+
+
 def _finalize_normalized_matrix(
     parts: list[pl.DataFrame],
     top_k: int,
     out_path: Path,
     label: str,
 ) -> None:
-    """Aggregate bucket edges and compute degree-normalized transition score `norm_score`."""
+    """Aggregate bucket edges and compute degree-normalized `norm_score` without `.over()` windows."""
     empty_schema = {
         "source_aid": pl.Int32,
         "aid": pl.Int32,
@@ -57,6 +76,7 @@ def _finalize_normalized_matrix(
         pl.DataFrame(schema=empty_schema).write_parquet(out_path)
         return
 
+    logger.info("[candidates] Finalizing & normalizing '%s' co-visitation matrix...", label)
     df = (
         pl.concat(parts)
         .lazy()
@@ -64,18 +84,21 @@ def _finalize_normalized_matrix(
         .agg(pl.col("score").sum().cast(pl.Float32).alias("score"))
         .sort(["source_aid", "score"], descending=[False, True])
         .group_by("source_aid", maintain_order=True)
-        .head(top_k)
-        .with_columns(
-            pl.int_range(1, pl.len() + 1).over("source_aid").cast(pl.Float32).alias("_rk"),
-            pl.col("score").max().over("source_aid").clip(lower_bound=1e-6).alias("_smax"),
-            pl.col("score").sum().over("source_aid").clip(lower_bound=1e-6).alias("_ssum"),
+        .agg(
+            pl.col("aid").head(top_k),
+            pl.col("score").head(top_k),
         )
-        # Blend conditional probability, max-ratio, reciprocal rank, and mild log-support tiebreaker
+        .with_columns(
+            pl.col("score").list.max().clip(lower_bound=1e-6).alias("_smax"),
+            pl.col("score").list.sum().clip(lower_bound=1e-6).alias("_ssum"),
+            pl.int_ranges(1, pl.col("aid").list.len() + 1, dtype=pl.UInt16).alias("_rk"),
+        )
+        .explode(["aid", "score", "_rk"])
         .with_columns(
             (
                 (
                     0.45 * (pl.col("score") / pl.col("_smax"))
-                    + 0.35 * (1.0 / (pl.col("_rk") + 2.0) * 3.0)
+                    + 0.35 * (1.0 / (pl.col("_rk").cast(pl.Float32) + 2.0) * 3.0)
                     + 0.20 * (pl.col("score") / pl.col("_ssum") * 5.0)
                 )
                 * (1.0 + 0.04 * pl.col("score").log1p())
@@ -86,6 +109,8 @@ def _finalize_normalized_matrix(
         .select("source_aid", "aid", "score", "norm_score")
         .collect()
     )
+    parts.clear()
+    gc.collect()
     df.write_parquet(out_path)
     logger.info(
         "[candidates] Saved %s co-visitation (%d normalized edges) -> %s",
@@ -134,10 +159,12 @@ def _build_clicks_and_carts_matrices(
     del tail_df
     gc.collect()
 
+    total_buckets = len(partitions)
     click_parts: list[pl.DataFrame] = []
     cart_parts: list[pl.DataFrame] = []
 
-    for idx, chunk_df in enumerate(partitions.values(), start=1):
+    for idx in range(1, total_buckets + 1):
+        _, chunk_df = partitions.popitem()
         chunk = chunk_df.lazy()
         right = chunk.select(
             pl.col("session"),
@@ -188,6 +215,7 @@ def _build_clicks_and_carts_matrices(
             )
             .collect()
         )
+        del chunk_df
 
         if len(pairs) > 0:
             c_top = (
@@ -195,7 +223,7 @@ def _build_clicks_and_carts_matrices(
                 .select("source_aid", "aid", pl.col("score_clicks").alias("score"))
                 .sort(["source_aid", "score"], descending=[False, True])
                 .group_by("source_aid", maintain_order=True)
-                .head(clicks_top_k * 2)
+                .head(clicks_top_k + 20)
                 .collect()
             )
             o_top = (
@@ -203,7 +231,7 @@ def _build_clicks_and_carts_matrices(
                 .select("source_aid", "aid", pl.col("score_carts").alias("score"))
                 .sort(["source_aid", "score"], descending=[False, True])
                 .group_by("source_aid", maintain_order=True)
-                .head(carts_top_k * 2)
+                .head(carts_top_k + 20)
                 .collect()
             )
             click_parts.append(c_top)
@@ -211,7 +239,9 @@ def _build_clicks_and_carts_matrices(
 
         del pairs
         if idx % 4 == 0:
-            logger.info("[candidates] Processed bucket %d/%d", idx, len(partitions))
+            click_parts = _compact_edge_parts(click_parts, clicks_top_k + 25)
+            cart_parts = _compact_edge_parts(cart_parts, carts_top_k + 25)
+            logger.info("[candidates] Processed & compacted bucket %d/%d", idx, total_buckets)
 
     del partitions
     gc.collect()
