@@ -35,10 +35,11 @@ def _type_code_expr(frame: pl.LazyFrame) -> pl.Expr:
 
 
 def _build_item_features(item_corpus: pl.LazyFrame) -> pl.LazyFrame:
-    """Aggregate global item popularity, conversion rates, and 7-day trend features."""
+    """Aggregate global item popularity, conversion rates, and 7d/2d trend features."""
     max_ts = item_corpus.select(pl.col("ts").max()).collect().item()
     ts_per_sec = 1000 if (max_ts is not None and int(max_ts) > 10_000_000_000) else 1
-    recent_cutoff = (int(max_ts) - 7 * 86_400 * ts_per_sec) if max_ts is not None else 0
+    recent_7d = (int(max_ts) - 7 * 86_400 * ts_per_sec) if max_ts is not None else 0
+    recent_2d = (int(max_ts) - 2 * 86_400 * ts_per_sec) if max_ts is not None else 0
 
     items = item_corpus.group_by("aid").agg(
         pl.len().cast(pl.Int32).alias("item_events"),
@@ -47,7 +48,8 @@ def _build_item_features(item_corpus: pl.LazyFrame) -> pl.LazyFrame:
             flag.sum().cast(pl.Int32).alias(f"item_{event}")
             for event, flag in zip(EVENTS, _type_flags(item_corpus))
         ],
-        (pl.col("ts") >= recent_cutoff).sum().cast(pl.Int32).alias("item_recent_7d_events"),
+        (pl.col("ts") >= recent_7d).sum().cast(pl.Int32).alias("item_recent_7d_events"),
+        (pl.col("ts") >= recent_2d).sum().cast(pl.Int32).alias("item_recent_2d_events"),
     )
     items = items.with_columns(
         pl.when(pl.col("item_clicks") > 0)
@@ -66,6 +68,12 @@ def _build_item_features(item_corpus: pl.LazyFrame) -> pl.LazyFrame:
         )
         .cast(pl.Float32)
         .alias("item_recent_share"),
+        (
+            pl.col("item_recent_2d_events").cast(pl.Float32)
+            / (pl.col("item_recent_7d_events").cast(pl.Float32) + 1.0)
+        )
+        .cast(pl.Float32)
+        .alias("item_2d_spike"),
     )
     return items
 
@@ -78,7 +86,7 @@ def _build_feature_table(
     out_path: Path,
     labels_path: Path | None = None,
 ) -> None:
-    """Build and stream a 32-feature candidate table for validation or test sessions."""
+    """Build and stream a 40-feature candidate table for validation or test sessions."""
     history = pl.scan_parquet(history_path)
     candidates = pl.scan_parquet(candidates_path)
 
@@ -87,7 +95,6 @@ def _build_feature_table(
     hist_flags = _type_flags(history)
     type_code = _type_code_expr(history)
 
-    # Session-level context features
     sessions = (
         history.group_by("session")
         .agg(
@@ -110,7 +117,6 @@ def _build_feature_table(
         )
     )
 
-    # Ordered session events for exact reverse position, last action type, and log-recency
     ordered_hist = (
         history.with_columns(type_code.alias("_tcode"))
         .sort(["session", "ts"])
@@ -164,7 +170,13 @@ def _build_feature_table(
 
     cand_schema = candidates.collect_schema()
     missing_cand_cols: list[pl.Expr] = []
-    for col_name in ("score_clicks", "score_carts_orders", "score_buy2buy"):
+    for col_name in (
+        "score_clicks",
+        "score_carts_orders",
+        "score_buy2buy",
+        "last_aid_covis",
+        "raw_covis_sum",
+    ):
         if col_name not in cand_schema:
             missing_cand_cols.append(pl.lit(0.0, dtype=pl.Float32).alias(col_name))
     if "covis_support" not in cand_schema:
@@ -179,7 +191,6 @@ def _build_feature_table(
             pl.int_range(1, pl.len() + 1).over("session").cast(pl.UInt16).alias("cand_rank")
         )
 
-    # Within-session relative retrieval strength
     candidates = candidates.with_columns(
         (
             pl.col("covisitation_score").fill_null(0.0)
@@ -205,6 +216,12 @@ def _build_feature_table(
         )
         .cast(pl.Float32)
         .alias("b2b_rel_max"),
+        (
+            pl.col("last_aid_covis").fill_null(0.0)
+            / (pl.col("last_aid_covis").max().over("session").fill_null(0.0) + 1e-5)
+        )
+        .cast(pl.Float32)
+        .alias("last_aid_rel_max"),
     )
 
     features = (
@@ -248,6 +265,8 @@ def _build_feature_table(
             "score_clicks",
             "score_carts_orders",
             "score_buy2buy",
+            "last_aid_covis",
+            "raw_covis_sum",
             "covis_support",
         ).fill_null(0),
         (pl.col("pair_events").fill_null(0) > 0).cast(pl.UInt8).alias("in_session"),

@@ -153,7 +153,7 @@ def _zscore_per_session(eval_ids: pl.DataFrame, scores: np.ndarray) -> np.ndarra
 
 
 def run_train(config: dict[str, Any], mode: str = "sample") -> None:
-    """Train per-objective LightGBM + CUDA XGBoost rankers and evaluate Recall@20."""
+    """Train per-objective LightGBM + CUDA XGBoost rankers and optimize blend weights."""
     features_path = Path(config["paths"]["features"]) / mode / "features.parquet"
     labels_path = Path(config["paths"]["splits"]) / mode / "labels.parquet"
     candidates_dir = Path(config["paths"]["candidates"]) / mode
@@ -171,12 +171,12 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
     seed = int(config["pipeline"]["seed"])
 
     raw_lgb_params: dict[str, Any] = dict(config["lightgbm"])
-    lgb_early_stop = int(raw_lgb_params.pop("early_stopping_rounds", 50))
+    lgb_early_stop = int(raw_lgb_params.pop("early_stopping_rounds", 60))
     raw_lgb_params.pop("ndcg_eval_at", None)
 
     xgb_cfg: dict[str, Any] = dict(config.get("xgboost", {}))
     xgb_enabled = bool(xgb_cfg.pop("enabled", True)) and (xgb is not None)
-    xgb_early_stop = int(xgb_cfg.pop("early_stopping_rounds", 50))
+    xgb_early_stop = int(xgb_cfg.pop("early_stopping_rounds", 60))
     has_cuda = _detect_cuda_gpu()
     if xgb_enabled:
         requested_dev = str(xgb_cfg.get("device", "auto"))
@@ -196,7 +196,6 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
         len(feature_cols),
     )
 
-    # Deterministic 80/20 session split: 80% ranker fit, 20% unbiased Recall@20 evaluation
     unique_sessions = df.select("session").unique(maintain_order=True)
     if len(unique_sessions) >= 5:
         val_mask = (pl.col("session").hash(seed=seed) % 5) == 0
@@ -221,22 +220,21 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
         pl.col("session").cast(pl.Int32),
         pl.col("aid").cast(pl.Int32),
     )
-    eval_groups = (
-        eval_df.group_by("session", maintain_order=True).len()["len"].to_numpy()
-    )
     x_eval = eval_df.select(feature_cols).to_numpy().astype(np.float32, copy=False)
+    eval_sessions = eval_df.select("session").unique()
+    ground_truth_df = _prepare_ground_truth(labels_path, eval_sessions)
 
-    # Also filter eval_set for early stopping to sessions with >=1 positive for fast metric calc
     fallbacks = _load_fallback_by_event(candidates_dir, top_k_predict)
     lgb_pred_frames: list[pl.DataFrame] = []
     xgb_pred_frames: list[pl.DataFrame] = []
     ens_pred_frames: list[pl.DataFrame] = []
     blend_weights: dict[str, dict[str, float]] = {}
 
+    dmatrix_eval = xgb.DMatrix(x_eval) if (xgb_enabled and xgb is not None) else None
+
     for event in event_types:
         label_col = f"label_{event}"
 
-        # Filter training sessions to groups with >=1 positive label (identical LambdaRank gradient, ~10x faster)
         pos_train_sessions = (
             train_df.group_by("session")
             .agg(pl.col(label_col).sum().alias("_pos"))
@@ -281,7 +279,7 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
         )
 
         lgb_params = dict(raw_lgb_params)
-        if len(obj_train_df) < int(lgb_params.get("min_child_samples", 50)) * 2:
+        if len(obj_train_df) < int(lgb_params.get("min_child_samples", 80)) * 2:
             lgb_params["min_child_samples"] = max(1, len(obj_train_df) // 4)
 
         ranker = lgb.LGBMRanker(**lgb_params)
@@ -301,13 +299,12 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
         lgb_model_path = models_dir / f"lgbm_{event}.txt"
         ranker.booster_.save_model(str(lgb_model_path))
         lgb_scores = ranker.booster_.predict(x_eval)
-        lgb_pred_frames.append(
-            _rank_scores_to_preds(
-                eval_ids, lgb_scores, event, fallbacks.get(event, []), top_k_predict
-            )
+        lgb_preds_ev = _rank_scores_to_preds(
+            eval_ids, lgb_scores, event, fallbacks.get(event, []), top_k_predict
         )
+        lgb_pred_frames.append(lgb_preds_ev)
 
-        if xgb_enabled and xgb is not None:
+        if xgb_enabled and xgb is not None and dmatrix_eval is not None:
             cur_xgb_params = dict(xgb_cfg)
             cur_xgb_params["early_stopping_rounds"] = xgb_early_stop
             xgb_ranker = xgb.XGBRanker(**cur_xgb_params)
@@ -319,34 +316,49 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
                 eval_group=[es_groups],
                 verbose=100,
             )
+            xgb_booster = xgb_ranker.get_booster()
             xgb_model_path = models_dir / f"xgb_{event}.json"
-            xgb_ranker.get_booster().save_model(str(xgb_model_path))
-            xgb_scores = xgb_ranker.get_booster().inplace_predict(x_eval)
-            xgb_pred_frames.append(
-                _rank_scores_to_preds(
-                    eval_ids, xgb_scores, event, fallbacks.get(event, []), top_k_predict
-                )
+            xgb_booster.save_model(str(xgb_model_path))
+            xgb_scores = xgb_booster.predict(dmatrix_eval)
+            xgb_preds_ev = _rank_scores_to_preds(
+                eval_ids, xgb_scores, event, fallbacks.get(event, []), top_k_predict
             )
+            xgb_pred_frames.append(xgb_preds_ev)
 
-            blended_scores = 0.5 * _zscore_per_session(
-                eval_ids, lgb_scores
-            ) + 0.5 * _zscore_per_session(eval_ids, xgb_scores)
-            ens_pred_frames.append(
-                _rank_scores_to_preds(
-                    eval_ids,
-                    blended_scores,
-                    event,
-                    fallbacks.get(event, []),
-                    top_k_predict,
+            # Tune optimal blend weight on validation Recall@20 for this objective
+            lgb_z = _zscore_per_session(eval_ids, lgb_scores)
+            xgb_z = _zscore_per_session(eval_ids, xgb_scores)
+            gt_ev = ground_truth_df.filter(pl.col("type") == event)
+
+            best_w_lgb = 0.5
+            best_score = -1.0
+            best_preds_ev = lgb_preds_ev
+            for w_lgb in (0.0, 0.25, 0.5, 0.75, 1.0):
+                blend = w_lgb * lgb_z + (1.0 - w_lgb) * xgb_z
+                cand_preds = _rank_scores_to_preds(
+                    eval_ids, blend, event, fallbacks.get(event, []), top_k_predict
                 )
+                ev_score = (
+                    compute_recall_at_k(cand_preds, gt_ev, k=top_k_predict)[event]
+                    if len(gt_ev) > 0
+                    else 0.0
+                )
+                if ev_score > best_score:
+                    best_score = ev_score
+                    best_w_lgb = w_lgb
+                    best_preds_ev = cand_preds
+
+            ens_pred_frames.append(best_preds_ev)
+            blend_weights[event] = {"lgbm": best_w_lgb, "xgb": round(1.0 - best_w_lgb, 2)}
+            logger.info(
+                "[train] '%s' optimal ensemble weights: lgbm=%.2f, xgb=%.2f",
+                event,
+                best_w_lgb,
+                1.0 - best_w_lgb,
             )
-            blend_weights[event] = {"lgbm": 0.5, "xgb": 0.5}
         else:
-            ens_pred_frames.append(lgb_pred_frames[-1])
+            ens_pred_frames.append(lgb_preds_ev)
             blend_weights[event] = {"lgbm": 1.0, "xgb": 0.0}
-
-    eval_sessions = eval_df.select("session").unique()
-    ground_truth_df = _prepare_ground_truth(labels_path, eval_sessions)
 
     lgb_recall = compute_recall_at_k(
         pl.concat(lgb_pred_frames), ground_truth_df, weights=metric_weights, k=top_k_predict

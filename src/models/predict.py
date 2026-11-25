@@ -114,6 +114,9 @@ def run_predict(config: dict[str, Any], mode: str = "sample") -> None:
             x_batch = (
                 batch_df.select(feature_cols).to_numpy().astype(np.float32, copy=False)
             )
+            dmatrix_batch = (
+                xgb.DMatrix(x_batch) if (xgb_boosters and xgb is not None) else None
+            )
             base_ids = batch_df.select(
                 pl.col("session").cast(pl.Int32),
                 pl.col("aid").cast(pl.Int32),
@@ -124,11 +127,18 @@ def run_predict(config: dict[str, Any], mode: str = "sample") -> None:
                 lgb_scores = lgb_boosters[event].predict(x_batch)
                 w = blend_weights.get(event, {"lgbm": 1.0, "xgb": 0.0})
 
-                if event in xgb_boosters and w.get("xgb", 0.0) > 0.0:
-                    xgb_scores = xgb_boosters[event].inplace_predict(x_batch)
-                    final_scores = float(w["lgbm"]) * _zscore_per_session(
-                        base_ids, lgb_scores
-                    ) + float(w["xgb"]) * _zscore_per_session(base_ids, xgb_scores)
+                if (
+                    event in xgb_boosters
+                    and dmatrix_batch is not None
+                    and w.get("xgb", 0.0) > 0.0
+                ):
+                    xgb_scores = xgb_boosters[event].predict(dmatrix_batch)
+                    if w.get("lgbm", 0.0) > 0.0:
+                        final_scores = float(w["lgbm"]) * _zscore_per_session(
+                            base_ids, lgb_scores
+                        ) + float(w["xgb"]) * _zscore_per_session(base_ids, xgb_scores)
+                    else:
+                        final_scores = xgb_scores
                 else:
                     final_scores = lgb_scores
 
