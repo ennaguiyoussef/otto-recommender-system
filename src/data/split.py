@@ -1,4 +1,4 @@
-"""Temporal train/validation split and session truncation for local validation."""
+"""Temporal train/validation split and session truncation with atomic checkpoints."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
+
+from src.utils.checkpoint import atomic_temp_path, commit_atomic, is_valid_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -82,13 +84,7 @@ def _session_sample_expr(frac: float, seed: int) -> pl.Expr:
 
 
 def _extract_ground_truth_labels(suffix_events: pl.LazyFrame) -> pl.LazyFrame:
-    """Extract official OTTO ground-truth targets from held-out session suffixes.
-
-    Official OTTO rules:
-      - clicks (0): single next clicked aid after truncation.
-      - carts  (1): all unique carted aids after truncation.
-      - orders (2): all unique ordered aids after truncation.
-    """
+    """Extract official OTTO ground-truth targets from held-out session suffixes."""
     ordered_suffix = suffix_events.sort(["session", "ts"])
 
     next_clicks = (
@@ -109,20 +105,12 @@ def _extract_ground_truth_labels(suffix_events: pl.LazyFrame) -> pl.LazyFrame:
 
 
 def run_split(config: dict[str, Any], mode: str = "sample") -> None:
-    """Generate leak-free temporal train/validation splits and ground-truth labels.
-
-    Mirrors the exact Kaggle OTTO test setup:
-      - All historical events (`ts < cutoff_ts`) PLUS the strictly observed prefixes
-        (`_row_idx < _split_idx`) of validation-window sessions form the observed
-        interaction corpus (`train.parquet`), while 100% of held-out suffixes
-        (`_row_idx >= _split_idx`) are strictly withheld from the corpus.
-      - Query validation sessions (`history.parquet`, `labels.parquet`) are sampled
-        at `sample_frac` (5% in `sample` mode, up to `max_val_sessions` in `full`).
-    """
+    """Generate leak-free temporal train/validation splits with Drive checkpointing."""
     raw_dir = Path(config["paths"]["raw_data"])
     sample_dir = Path(config["paths"]["sample_data"])
     out_dir = Path(config["paths"]["splits"]) / mode
     out_dir.mkdir(parents=True, exist_ok=True)
+    force = bool(config.get("force_recompute", False))
 
     mode_cfg = config.get("modes", {}).get(mode, {})
     history_corpus_frac = float(mode_cfg.get("history_corpus_frac", 1.0))
@@ -131,9 +119,8 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
     max_val_sessions = int(config["pipeline"].get("max_val_sessions", 300_000))
     seed = int(config["pipeline"]["seed"])
 
-    use_raw_for_history = (
-        mode == "full"
-        or (history_corpus_frac >= 1.0 and any(raw_dir.rglob("*.parquet")))
+    use_raw_for_history = mode == "full" or (
+        history_corpus_frac >= 1.0 and any(raw_dir.rglob("*.parquet"))
     )
     train_source_dir = raw_dir if use_raw_for_history else sample_dir
     test_source_dir = (
@@ -141,6 +128,25 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
         if (mode == "sample" and any(sample_dir.rglob("*test*.parquet")))
         else train_source_dir
     )
+
+    train_files = _discover_train_files(train_source_dir)
+    test_files = _discover_test_files(test_source_dir)
+
+    train_path = out_dir / "train.parquet"
+    history_path = out_dir / "history.parquet"
+    labels_path = out_dir / "labels.parquet"
+    test_out = out_dir / "test_history.parquet"
+
+    required_targets = [train_path, history_path, labels_path]
+    if test_files:
+        required_targets.append(test_out)
+
+    if all(is_valid_checkpoint(p, force=force) for p in required_targets):
+        logger.info(
+            "[checkpoint] All split Parquet files already exist in '%s'; skipping.",
+            out_dir,
+        )
+        return
 
     logger.info(
         "[split] Splitting sessions (mode=%s, val_days=%d, query_frac=%.2f, corpus_frac=%.2f) from '%s' -> '%s'",
@@ -152,10 +158,7 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
         out_dir,
     )
 
-    train_files = _discover_train_files(train_source_dir)
-    test_files = _discover_test_files(test_source_dir)
     events = _normalize_events(train_files)
-
     ts_stats = events.select(
         pl.col("ts").min().alias("min_ts"),
         pl.col("ts").max().alias("max_ts"),
@@ -179,109 +182,117 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
         cutoff_ts,
     )
 
-    train_path = out_dir / "train.parquet"
-    history_path = out_dir / "history.parquet"
-    labels_path = out_dir / "labels.parquet"
-
-    # Identify all sessions starting in the validation window with >= 2 events
-    strict_val_sessions_df = (
-        events.group_by("session")
-        .agg(
-            pl.col("ts").min().alias("_s_min"),
-            pl.len().alias("_s_len"),
-        )
-        .filter((pl.col("_s_min") >= cutoff_ts) & (pl.col("_s_len") >= 2))
-        .select("session")
-        .collect()
-    )
-    if len(strict_val_sessions_df) == 0:
+    if not all(
+        is_valid_checkpoint(p, force=force) for p in (train_path, history_path, labels_path)
+    ):
         strict_val_sessions_df = (
-            events.filter(pl.col("ts") >= cutoff_ts)
-            .group_by("session")
-            .len()
-            .filter(pl.col("len") >= 2)
+            events.group_by("session")
+            .agg(
+                pl.col("ts").min().alias("_s_min"),
+                pl.len().alias("_s_len"),
+            )
+            .filter((pl.col("_s_min") >= cutoff_ts) & (pl.col("_s_len") >= 2))
             .select("session")
             .collect()
         )
-
-    tmp_val_dir = Path(tempfile.mkdtemp(prefix="otto_split_"))
-    try:
-        tmp_trunc_path = tmp_val_dir / "val_truncated.parquet"
-        # Materialize truncated validation window once to avoid 3x re-sorting 53M rows
-        (
-            events.filter(pl.col("ts") >= cutoff_ts)
-            .join(strict_val_sessions_df.lazy(), on="session", how="semi")
-            .sort(["session", "ts"])
-            .with_columns(
-                pl.len().over("session").alias("_sess_len"),
-                pl.int_range(0, pl.len()).over("session").alias("_row_idx"),
+        if len(strict_val_sessions_df) == 0:
+            strict_val_sessions_df = (
+                events.filter(pl.col("ts") >= cutoff_ts)
+                .group_by("session")
+                .len()
+                .filter(pl.col("len") >= 2)
+                .select("session")
+                .collect()
             )
-            .filter(pl.col("_sess_len") >= 2)
-            .with_columns(
-                (
-                    1
-                    + (
-                        pl.col("session").hash(seed=seed)
-                        % (pl.col("_sess_len") - 1).cast(pl.UInt64)
-                    ).cast(pl.Int64)
-                ).alias("_split_idx")
+
+        tmp_val_dir = Path(tempfile.mkdtemp(prefix="otto_split_"))
+        try:
+            tmp_trunc_path = tmp_val_dir / "val_truncated.parquet"
+            (
+                events.filter(pl.col("ts") >= cutoff_ts)
+                .join(strict_val_sessions_df.lazy(), on="session", how="semi")
+                .sort(["session", "ts"])
+                .with_columns(
+                    pl.len().over("session").alias("_sess_len"),
+                    pl.int_range(0, pl.len()).over("session").alias("_row_idx"),
+                )
+                .filter(pl.col("_sess_len") >= 2)
+                .with_columns(
+                    (
+                        1
+                        + (
+                            pl.col("session").hash(seed=seed)
+                            % (pl.col("_sess_len") - 1).cast(pl.UInt64)
+                        ).cast(pl.Int64)
+                    ).alias("_split_idx")
+                )
+                .sink_parquet(tmp_trunc_path)
             )
-            .sink_parquet(tmp_trunc_path)
-        )
-        all_val_truncated = pl.scan_parquet(tmp_trunc_path)
+            all_val_truncated = pl.scan_parquet(tmp_trunc_path)
 
-        query_val_sessions = strict_val_sessions_df
-        if use_raw_for_history and sample_frac < 1.0:
-            query_val_sessions = query_val_sessions.filter(
-                _session_sample_expr(sample_frac, seed)
+            query_val_sessions = strict_val_sessions_df
+            if use_raw_for_history and sample_frac < 1.0:
+                query_val_sessions = query_val_sessions.filter(
+                    _session_sample_expr(sample_frac, seed)
+                )
+            if len(query_val_sessions) > max_val_sessions:
+                query_val_sessions = query_val_sessions.sample(
+                    n=max_val_sessions, seed=seed
+                )
+
+            logger.info(
+                "[split] Selected %d/%d validation query sessions (100%% suffixes held out).",
+                len(query_val_sessions),
+                len(strict_val_sessions_df),
             )
-        if len(query_val_sessions) > max_val_sessions:
-            query_val_sessions = query_val_sessions.sample(n=max_val_sessions, seed=seed)
 
-        logger.info(
-            "[split] Selected %d/%d validation query sessions (100%% suffixes held out).",
-            len(query_val_sessions),
-            len(strict_val_sessions_df),
-        )
+            if not is_valid_checkpoint(train_path, force=force):
+                non_query_observed_prefixes = (
+                    all_val_truncated.join(
+                        query_val_sessions.lazy(), on="session", how="anti"
+                    )
+                    .filter(pl.col("_row_idx") < pl.col("_split_idx"))
+                    .select("session", "aid", "ts", "type")
+                )
+                hist_corpus = events.filter(pl.col("ts") < cutoff_ts)
+                if history_corpus_frac < 1.0 and use_raw_for_history:
+                    hist_corpus = hist_corpus.filter(
+                        _session_sample_expr(history_corpus_frac, seed)
+                    )
+                tmp_train = atomic_temp_path(train_path)
+                pl.concat([hist_corpus, non_query_observed_prefixes]).sink_parquet(
+                    tmp_train
+                )
+                commit_atomic(tmp_train, train_path)
 
-        non_query_observed_prefixes = (
-            all_val_truncated.join(query_val_sessions.lazy(), on="session", how="anti")
-            .filter(pl.col("_row_idx") < pl.col("_split_idx"))
-            .select("session", "aid", "ts", "type")
-        )
+            query_val_events = all_val_truncated.join(
+                query_val_sessions.lazy(), on="session", how="semi"
+            )
 
-        hist_corpus = events.filter(pl.col("ts") < cutoff_ts)
-        if history_corpus_frac < 1.0 and use_raw_for_history:
-            hist_corpus = hist_corpus.filter(_session_sample_expr(history_corpus_frac, seed))
+            if not is_valid_checkpoint(history_path, force=force):
+                tmp_hist = atomic_temp_path(history_path)
+                query_val_events.filter(pl.col("_row_idx") < pl.col("_split_idx")).select(
+                    "session", "aid", "ts", "type"
+                ).sink_parquet(tmp_hist)
+                commit_atomic(tmp_hist, history_path)
 
-        pl.concat([hist_corpus, non_query_observed_prefixes]).sink_parquet(train_path)
+            if not is_valid_checkpoint(labels_path, force=force):
+                tmp_lbl = atomic_temp_path(labels_path)
+                suffix_events = query_val_events.filter(
+                    pl.col("_row_idx") >= pl.col("_split_idx")
+                ).select("session", "aid", "ts", "type")
+                _extract_ground_truth_labels(suffix_events).sink_parquet(tmp_lbl)
+                commit_atomic(tmp_lbl, labels_path)
+        finally:
+            shutil.rmtree(tmp_val_dir, ignore_errors=True)
 
-        query_val_events = all_val_truncated.join(
-            query_val_sessions.lazy(), on="session", how="semi"
-        )
-        query_val_events.filter(pl.col("_row_idx") < pl.col("_split_idx")).select(
-            "session", "aid", "ts", "type"
-        ).sink_parquet(history_path)
-
-        suffix_events = query_val_events.filter(
-            pl.col("_row_idx") >= pl.col("_split_idx")
-        ).select("session", "aid", "ts", "type")
-        _extract_ground_truth_labels(suffix_events).sink_parquet(labels_path)
-    finally:
-        shutil.rmtree(tmp_val_dir, ignore_errors=True)
-
-    # Kaggle test events
-    if test_files:
-        test_out = out_dir / "test_history.parquet"
+    if test_files and not is_valid_checkpoint(test_out, force=force):
+        tmp_test = atomic_temp_path(test_out)
         test_lf = _normalize_events(test_files)
         if mode == "sample" and test_source_dir == raw_dir and sample_frac < 1.0:
             test_lf = test_lf.filter(_session_sample_expr(sample_frac, seed))
-        test_lf.sort(["session", "ts"]).sink_parquet(test_out)
+        test_lf.sort(["session", "ts"]).sink_parquet(tmp_test)
+        commit_atomic(tmp_test, test_out)
         logger.info("[split] Wrote standardized test history -> %s", test_out)
-    else:
-        logger.warning(
-            "[split] No test Parquet found in '%s'; skipping test_history.parquet.",
-            test_source_dir,
-        )
 
     logger.info("[split] Completed leak-free splits in '%s'.", out_dir)

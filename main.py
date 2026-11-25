@@ -48,20 +48,20 @@ def setup_logging() -> None:
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="OTTO Multi-Objective Recommender System (2-Stage Pipeline)",
+        description="OTTO Multi-Objective Recommender System (Fault-Tolerant 2-Stage Pipeline)",
     )
     parser.add_argument(
         "--mode",
         type=str,
         choices=["sample", "full"],
         default="sample",
-        help="Execution mode: 'sample' (5%% fast test) or 'full' (100%% dataset).",
+        help="Execution mode: 'sample' (5%% fast validation) or 'full' (100%% dataset).",
     )
     parser.add_argument(
         "--stage",
         type=str,
         default="all",
-        help="Pipeline stage ('all', single stage, or comma-separated e.g. 'candidates,features,train,predict').",
+        help="Pipeline stage ('all', single stage, or comma-separated e.g. 'train,predict').",
     )
     parser.add_argument(
         "--config",
@@ -69,23 +69,31 @@ def parse_args() -> argparse.Namespace:
         default="configs/config.yaml",
         help="Path to the YAML configuration file.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force recomputation of requested stage(s), ignoring existing Drive checkpoints.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    """Execute the requested OTTO pipeline stage(s)."""
+    """Execute the requested OTTO pipeline stage(s) with automatic Drive checkpointing."""
     setup_logging()
     logger = logging.getLogger("otto.main")
     args = parse_args()
 
     logger.info(
-        "Starting OTTO pipeline | mode='%s' | stage='%s' | config='%s'",
+        "Starting OTTO pipeline | mode='%s' | stage='%s' | force=%s | config='%s'",
         args.mode,
         args.stage,
+        args.force,
         args.config,
     )
 
     config = load_config(config_path=args.config, mode=args.mode, create_dirs=True)
+    config["force_recompute"] = bool(args.force)
+
     if args.stage == "all":
         stages_to_run = PIPELINE_ORDER
     else:

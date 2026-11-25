@@ -1,7 +1,10 @@
-"""Stage-2 Reranker training: Positive-filtered LightGBM + CUDA GPU XGBoost Ensemble."""
+"""Stage-2 Reranker training: 3-Way Ensemble (LightGBM + GPU XGBoost + Stage-1 Prior)
+with per-model Google Drive checkpointing and seamless GPU->CPU fallback.
+"""
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import shutil
@@ -14,6 +17,7 @@ import numpy as np
 import polars as pl
 
 from src.metrics.recall import CODE_TO_TYPE, compute_recall_at_k
+from src.utils.checkpoint import atomic_temp_path, commit_atomic, is_valid_checkpoint
 
 try:
     import xgboost as xgb
@@ -50,7 +54,9 @@ def _detect_cuda_gpu() -> bool:
             check=False,
         )
         if res.returncode == 0 and "GPU" in res.stdout:
-            logger.info("[train] Detected NVIDIA GPU: %s", res.stdout.strip().splitlines()[0])
+            logger.info(
+                "[train] Detected NVIDIA GPU: %s", res.stdout.strip().splitlines()[0]
+            )
             return True
     except Exception:
         pass
@@ -135,11 +141,13 @@ def _rank_scores_to_preds(
         .agg(pl.col("aid").head(k).alias("labels"))
         .with_columns(pl.lit(event).alias("type"))
     )
-    return _pad_predictions_vectorized(ranked, fallback, k).select("session", "type", "labels")
+    return _pad_predictions_vectorized(ranked, fallback, k).select(
+        "session", "type", "labels"
+    )
 
 
 def _zscore_per_session(eval_ids: pl.DataFrame, scores: np.ndarray) -> np.ndarray:
-    """Standardize raw ranker margins within each session before ensembling."""
+    """Standardize raw margins within each session before ensembling."""
     normed = eval_ids.with_columns(pl.Series("_s", scores, dtype=pl.Float32)).select(
         (
             (pl.col("_s") - pl.col("_s").mean().over("session"))
@@ -152,13 +160,70 @@ def _zscore_per_session(eval_ids: pl.DataFrame, scores: np.ndarray) -> np.ndarra
     return normed["_z"].to_numpy()
 
 
+def compute_stage1_priors(df: pl.DataFrame, event: str) -> tuple[np.ndarray, np.ndarray]:
+    """Compute Stage-1 rank curve and objective-specific heuristic score from feature cols."""
+    cols = set(df.columns)
+
+    def _col_or_zero(name: str) -> pl.Expr:
+        return (
+            pl.col(name).fill_null(0.0).cast(pl.Float32)
+            if name in cols
+            else pl.lit(0.0, dtype=pl.Float32)
+        )
+
+    rank_expr = (-((_col_or_zero("cand_rank") + 1.0).log())).cast(pl.Float32)
+
+    in_sess = _col_or_zero("in_session")
+    log_rec = _col_or_zero("pair_log_recency")
+    p_clicks = _col_or_zero("pair_clicks")
+    p_carts = _col_or_zero("pair_carts")
+    p_orders = _col_or_zero("pair_orders")
+    s_clicks = _col_or_zero("score_clicks")
+    s_carts = _col_or_zero("score_carts_orders")
+    s_b2b = _col_or_zero("score_buy2buy")
+    s_last = _col_or_zero("last_aid_covis")
+    s_covis = _col_or_zero("covisitation_score")
+
+    if event == "clicks":
+        obj_expr = (
+            in_sess * (6.0 + 1.4 * log_rec + 0.5 * p_clicks)
+            + 1.6 * s_clicks
+            + 2.0 * s_last
+            + 0.8 * s_carts
+            + 0.2 * s_covis
+        )
+    elif event == "carts":
+        obj_expr = (
+            in_sess * (7.5 + 1.4 * log_rec + 1.5 * p_clicks + 2.0 * p_carts)
+            + 1.8 * s_carts
+            + 1.5 * s_b2b
+            + 1.0 * s_clicks
+            + 1.2 * s_last
+        )
+    else:  # orders
+        obj_expr = (
+            in_sess * (12.0 + 1.6 * log_rec + 4.5 * p_carts + 2.0 * p_orders)
+            + 2.0 * s_carts
+            + 2.4 * s_b2b
+            + 0.6 * s_clicks
+            + 0.8 * s_last
+        )
+
+    out = df.select(
+        rank_expr.alias("_rk_prior"),
+        obj_expr.cast(pl.Float32).alias("_obj_prior"),
+    )
+    return out["_rk_prior"].to_numpy(), out["_obj_prior"].to_numpy()
+
+
 def run_train(config: dict[str, Any], mode: str = "sample") -> None:
-    """Train per-objective LightGBM + CUDA XGBoost rankers and optimize blend weights."""
+    """Train per-objective LightGBM + XGBoost rankers with Drive resume and 3-way ensembling."""
     features_path = Path(config["paths"]["features"]) / mode / "features.parquet"
     labels_path = Path(config["paths"]["splits"]) / mode / "labels.parquet"
     candidates_dir = Path(config["paths"]["candidates"]) / mode
     models_dir = Path(config["paths"]["models"]) / mode
     models_dir.mkdir(parents=True, exist_ok=True)
+    force = bool(config.get("force_recompute", False))
 
     if not features_path.exists():
         raise FileNotFoundError(
@@ -177,11 +242,35 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
     xgb_cfg: dict[str, Any] = dict(config.get("xgboost", {}))
     xgb_enabled = bool(xgb_cfg.pop("enabled", True)) and (xgb is not None)
     xgb_early_stop = int(xgb_cfg.pop("early_stopping_rounds", 60))
+
+    meta_path = models_dir / "model_meta.json"
+    expected_models = [models_dir / f"lgbm_{ev}.txt" for ev in event_types]
+    if xgb_enabled:
+        expected_models.extend(models_dir / f"xgb_{ev}.json" for ev in event_types)
+
+    if is_valid_checkpoint(meta_path, force=force) and all(
+        is_valid_checkpoint(m, force=force) for m in expected_models
+    ):
+        saved_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        first_bw = next(iter(saved_meta.get("blend_weights", {}).values()), {})
+        if "s1_rank" in first_bw:
+            logger.info(
+                "[checkpoint] All trained models & 3-way metadata already exist in '%s' (Recall@20=%s); skipping (--force to retrain).",
+                models_dir,
+                saved_meta.get("validation_recall"),
+            )
+            return
+        logger.info(
+            "[checkpoint] Upgrading 2-way metadata to 3-way ensemble using existing model checkpoints..."
+        )
+
     has_cuda = _detect_cuda_gpu()
     if xgb_enabled:
         requested_dev = str(xgb_cfg.get("device", "auto"))
-        xgb_cfg["device"] = "cuda" if (requested_dev in {"auto", "cuda"} and has_cuda) else "cpu"
-        logger.info("[train] XGBoost Ranker enabled on device='%s'", xgb_cfg["device"])
+        xgb_cfg["device"] = (
+            "cuda" if (requested_dev in {"auto", "cuda"} and has_cuda) else "cpu"
+        )
+        logger.info("[train] XGBoost Ranker active on device='%s'", xgb_cfg["device"])
 
     logger.info("[train] Loading validation candidate features from '%s'", features_path)
     df = pl.read_parquet(features_path).sort(["session", "cand_rank"])
@@ -215,6 +304,8 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
             if len(unique_sessions) > 1
             else train_df
         )
+    del df
+    gc.collect()
 
     eval_ids = eval_df.select(
         pl.col("session").cast(pl.Int32),
@@ -225,6 +316,7 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
     ground_truth_df = _prepare_ground_truth(labels_path, eval_sessions)
 
     fallbacks = _load_fallback_by_event(candidates_dir, top_k_predict)
+    s1_pred_frames: list[pl.DataFrame] = []
     lgb_pred_frames: list[pl.DataFrame] = []
     xgb_pred_frames: list[pl.DataFrame] = []
     ens_pred_frames: list[pl.DataFrame] = []
@@ -234,134 +326,241 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
 
     for event in event_types:
         label_col = f"label_{event}"
-
-        pos_train_sessions = (
-            train_df.group_by("session")
-            .agg(pl.col(label_col).sum().alias("_pos"))
-            .filter(pl.col("_pos") > 0)
-            .select("session")
-        )
-        obj_train_df = train_df.join(pos_train_sessions, on="session", how="semi").sort(
-            "session"
-        )
-        if len(obj_train_df) == 0:
-            obj_train_df = train_df
-
-        pos_eval_sessions = (
-            eval_df.group_by("session")
-            .agg(pl.col(label_col).sum().alias("_pos"))
-            .filter(pl.col("_pos") > 0)
-            .select("session")
-        )
-        obj_es_df = eval_df.join(pos_eval_sessions, on="session", how="semi").sort("session")
-        if len(obj_es_df) == 0:
-            obj_es_df = eval_df
-
-        x_tr = obj_train_df.select(feature_cols).to_numpy().astype(np.float32, copy=False)
-        y_tr = obj_train_df[label_col].to_numpy()
-        tr_groups = (
-            obj_train_df.group_by("session", maintain_order=True).len()["len"].to_numpy()
-        )
-
-        x_es = obj_es_df.select(feature_cols).to_numpy().astype(np.float32, copy=False)
-        y_es = obj_es_df[label_col].to_numpy()
-        es_groups = (
-            obj_es_df.group_by("session", maintain_order=True).len()["len"].to_numpy()
-        )
-
-        logger.info(
-            "[train] '%s' | Filtered positive groups: %d/%d sessions (%d rows, %d positives)",
-            event,
-            len(tr_groups),
-            train_df["session"].n_unique(),
-            len(x_tr),
-            int(y_tr.sum()),
-        )
-
-        lgb_params = dict(raw_lgb_params)
-        if len(obj_train_df) < int(lgb_params.get("min_child_samples", 80)) * 2:
-            lgb_params["min_child_samples"] = max(1, len(obj_train_df) // 4)
-
-        ranker = lgb.LGBMRanker(**lgb_params)
-        ranker.fit(
-            x_tr,
-            y_tr,
-            group=tr_groups,
-            eval_set=[(x_es, y_es)],
-            eval_group=[es_groups],
-            eval_at=[top_k_predict],
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=lgb_early_stop, verbose=False),
-                lgb.log_evaluation(period=100),
-            ],
-        )
-
         lgb_model_path = models_dir / f"lgbm_{event}.txt"
-        ranker.booster_.save_model(str(lgb_model_path))
-        lgb_scores = ranker.booster_.predict(x_eval)
-        lgb_preds_ev = _rank_scores_to_preds(
-            eval_ids, lgb_scores, event, fallbacks.get(event, []), top_k_predict
-        )
-        lgb_pred_frames.append(lgb_preds_ev)
+        xgb_model_path = models_dir / f"xgb_{event}.json"
 
-        if xgb_enabled and xgb is not None and dmatrix_eval is not None:
-            cur_xgb_params = dict(xgb_cfg)
-            cur_xgb_params["early_stopping_rounds"] = xgb_early_stop
-            xgb_ranker = xgb.XGBRanker(**cur_xgb_params)
-            xgb_ranker.fit(
+        need_lgb = not is_valid_checkpoint(lgb_model_path, force=force)
+        need_xgb = xgb_enabled and not is_valid_checkpoint(xgb_model_path, force=force)
+
+        if need_lgb or need_xgb:
+            pos_train_sessions = (
+                train_df.group_by("session")
+                .agg(pl.col(label_col).sum().alias("_pos"))
+                .filter(pl.col("_pos") > 0)
+                .select("session")
+            )
+            obj_train_df = train_df.join(
+                pos_train_sessions, on="session", how="semi"
+            ).sort("session")
+            if len(obj_train_df) == 0:
+                obj_train_df = train_df
+
+            pos_eval_sessions = (
+                eval_df.group_by("session")
+                .agg(pl.col(label_col).sum().alias("_pos"))
+                .filter(pl.col("_pos") > 0)
+                .select("session")
+            )
+            obj_es_df = eval_df.join(pos_eval_sessions, on="session", how="semi").sort(
+                "session"
+            )
+            if len(obj_es_df) == 0:
+                obj_es_df = eval_df
+
+            x_tr = (
+                obj_train_df.select(feature_cols)
+                .to_numpy()
+                .astype(np.float32, copy=False)
+            )
+            y_tr = obj_train_df[label_col].to_numpy()
+            tr_groups = (
+                obj_train_df.group_by("session", maintain_order=True)
+                .len()["len"]
+                .to_numpy()
+            )
+
+            x_es = (
+                obj_es_df.select(feature_cols).to_numpy().astype(np.float32, copy=False)
+            )
+            y_es = obj_es_df[label_col].to_numpy()
+            es_groups = (
+                obj_es_df.group_by("session", maintain_order=True)
+                .len()["len"]
+                .to_numpy()
+            )
+
+            logger.info(
+                "[train] '%s' | Filtered positive groups: %d/%d sessions (%d rows, %d positives)",
+                event,
+                len(tr_groups),
+                train_df["session"].n_unique(),
+                len(x_tr),
+                int(y_tr.sum()),
+            )
+        else:
+            x_tr = y_tr = tr_groups = x_es = y_es = es_groups = None  # type: ignore[assignment]
+
+        # 1. LightGBM Ranker (checkpointed)
+        if not need_lgb:
+            logger.info(
+                "[checkpoint] Loaded existing LightGBM model for '%s' -> %s",
+                event,
+                lgb_model_path,
+            )
+            lgb_booster = lgb.Booster(model_file=str(lgb_model_path))
+        else:
+            lgb_params = dict(raw_lgb_params)
+            if len(x_tr) < int(lgb_params.get("min_child_samples", 80)) * 2:
+                lgb_params["min_child_samples"] = max(1, len(x_tr) // 4)
+            ranker = lgb.LGBMRanker(**lgb_params)
+            ranker.fit(
                 x_tr,
                 y_tr,
                 group=tr_groups,
                 eval_set=[(x_es, y_es)],
                 eval_group=[es_groups],
-                verbose=100,
+                eval_at=[top_k_predict],
+                callbacks=[
+                    lgb.early_stopping(stopping_rounds=lgb_early_stop, verbose=False),
+                    lgb.log_evaluation(period=100),
+                ],
             )
-            xgb_booster = xgb_ranker.get_booster()
-            xgb_model_path = models_dir / f"xgb_{event}.json"
-            xgb_booster.save_model(str(xgb_model_path))
+            lgb_booster = ranker.booster_
+            tmp_lgb = atomic_temp_path(lgb_model_path)
+            lgb_booster.save_model(str(tmp_lgb))
+            commit_atomic(tmp_lgb, lgb_model_path)
+            logger.info("[train] Checkpointed LightGBM '%s' -> %s", event, lgb_model_path)
+
+        lgb_scores = lgb_booster.predict(x_eval)
+        lgb_preds_ev = _rank_scores_to_preds(
+            eval_ids, lgb_scores, event, fallbacks.get(event, []), top_k_predict
+        )
+        lgb_pred_frames.append(lgb_preds_ev)
+
+        # 2. XGBoost Ranker (checkpointed, auto CUDA / CPU)
+        xgb_scores: np.ndarray | None = None
+        if xgb_enabled and xgb is not None and dmatrix_eval is not None:
+            if not need_xgb:
+                logger.info(
+                    "[checkpoint] Loaded existing XGBoost model for '%s' -> %s",
+                    event,
+                    xgb_model_path,
+                )
+                xgb_booster = xgb.Booster()
+                xgb_booster.load_model(str(xgb_model_path))
+                xgb_booster.set_param({"device": xgb_cfg["device"]})
+            else:
+                cur_xgb_params = dict(xgb_cfg)
+                cur_xgb_params["early_stopping_rounds"] = xgb_early_stop
+                xgb_ranker = xgb.XGBRanker(**cur_xgb_params)
+                xgb_ranker.fit(
+                    x_tr,
+                    y_tr,
+                    group=tr_groups,
+                    eval_set=[(x_es, y_es)],
+                    eval_group=[es_groups],
+                    verbose=100,
+                )
+                xgb_booster = xgb_ranker.get_booster()
+                tmp_xgb = atomic_temp_path(xgb_model_path)
+                xgb_booster.save_model(str(tmp_xgb))
+                commit_atomic(tmp_xgb, xgb_model_path)
+                logger.info(
+                    "[train] Checkpointed XGBoost '%s' -> %s", event, xgb_model_path
+                )
+
             xgb_scores = xgb_booster.predict(dmatrix_eval)
-            xgb_preds_ev = _rank_scores_to_preds(
-                eval_ids, xgb_scores, event, fallbacks.get(event, []), top_k_predict
-            )
-            xgb_pred_frames.append(xgb_preds_ev)
-
-            # Tune optimal blend weight on validation Recall@20 for this objective
-            lgb_z = _zscore_per_session(eval_ids, lgb_scores)
-            xgb_z = _zscore_per_session(eval_ids, xgb_scores)
-            gt_ev = ground_truth_df.filter(pl.col("type") == event)
-
-            best_w_lgb = 0.5
-            best_score = -1.0
-            best_preds_ev = lgb_preds_ev
-            for w_lgb in (0.0, 0.25, 0.5, 0.75, 1.0):
-                blend = w_lgb * lgb_z + (1.0 - w_lgb) * xgb_z
-                cand_preds = _rank_scores_to_preds(
-                    eval_ids, blend, event, fallbacks.get(event, []), top_k_predict
+            xgb_pred_frames.append(
+                _rank_scores_to_preds(
+                    eval_ids, xgb_scores, event, fallbacks.get(event, []), top_k_predict
                 )
-                ev_score = (
-                    compute_recall_at_k(cand_preds, gt_ev, k=top_k_predict)[event]
-                    if len(gt_ev) > 0
-                    else 0.0
-                )
-                if ev_score > best_score:
-                    best_score = ev_score
-                    best_w_lgb = w_lgb
-                    best_preds_ev = cand_preds
-
-            ens_pred_frames.append(best_preds_ev)
-            blend_weights[event] = {"lgbm": best_w_lgb, "xgb": round(1.0 - best_w_lgb, 2)}
-            logger.info(
-                "[train] '%s' optimal ensemble weights: lgbm=%.2f, xgb=%.2f",
-                event,
-                best_w_lgb,
-                1.0 - best_w_lgb,
             )
-        else:
-            ens_pred_frames.append(lgb_preds_ev)
-            blend_weights[event] = {"lgbm": 1.0, "xgb": 0.0}
 
+        # 3. 3-Way Ensemble Optimization: LightGBM + XGBoost + Stage-1 Priors
+        rk_raw, obj_raw = compute_stage1_priors(eval_df, event)
+        s1_preds_ev = _rank_scores_to_preds(
+            eval_ids, rk_raw, event, fallbacks.get(event, []), top_k_predict
+        )
+        s1_pred_frames.append(s1_preds_ev)
+
+        z_lgb = _zscore_per_session(eval_ids, lgb_scores)
+        z_xgb = (
+            _zscore_per_session(eval_ids, xgb_scores)
+            if xgb_scores is not None
+            else z_lgb
+        )
+        z_rk = _zscore_per_session(eval_ids, rk_raw)
+        z_obj = _zscore_per_session(eval_ids, obj_raw)
+
+        gt_ev = ground_truth_df.filter(pl.col("type") == event)
+        best_score = -1.0
+        best_weights = {"lgbm": 1.0, "xgb": 0.0, "s1_rank": 0.0, "s1_obj": 0.0}
+        best_preds_ev = lgb_preds_ev
+
+        # Candidate weight grid covering pure Stage-1, pure GBDT, and smooth 3-way blends
+        gbdt_ratios = (1.0, 0.7, 0.5, 0.3, 0.0) if xgb_scores is not None else (1.0,)
+        s1_totals = (0.0, 0.15, 0.30, 0.45, 0.60, 0.80, 1.0)
+        for w_s1_total in s1_totals:
+            w_gbdt_total = round(1.0 - w_s1_total, 4)
+            s1_mixes = (0.0, 0.5, 1.0) if w_s1_total > 0 else (0.0,)
+            r_list = gbdt_ratios if w_gbdt_total > 0 else (1.0,)
+            for r_lgb in r_list:
+                for r_rk in s1_mixes:
+                    w_lgb = round(w_gbdt_total * r_lgb, 4)
+                    w_xgb = round(w_gbdt_total * (1.0 - r_lgb), 4)
+                    w_rk = round(w_s1_total * r_rk, 4)
+                    w_obj = round(w_s1_total * (1.0 - r_rk), 4)
+
+                    blend = (
+                        w_lgb * z_lgb
+                        + w_xgb * z_xgb
+                        + w_rk * z_rk
+                        + w_obj * z_obj
+                    )
+                    cand_preds = _rank_scores_to_preds(
+                        eval_ids, blend, event, fallbacks.get(event, []), top_k_predict
+                    )
+                    ev_score = (
+                        compute_recall_at_k(
+                            cand_preds, gt_ev, k=top_k_predict
+                        )[event]
+                        if len(gt_ev) > 0
+                        else 0.0
+                    )
+                    if ev_score > best_score:
+                        best_score = ev_score
+                        best_weights = {
+                            "lgbm": w_lgb,
+                            "xgb": w_xgb,
+                            "s1_rank": w_rk,
+                            "s1_obj": w_obj,
+                        }
+                        best_preds_ev = cand_preds
+
+        ens_pred_frames.append(best_preds_ev)
+        blend_weights[event] = best_weights
+        logger.info(
+            "[train] '%s' optimal 3-way weights: %s -> eval Recall@%d=%.5f",
+            event,
+            best_weights,
+            top_k_predict,
+            best_score,
+        )
+        gc.collect()
+
+    s1_recall = compute_recall_at_k(
+        pl.concat(s1_pred_frames), ground_truth_df, weights=metric_weights, k=top_k_predict
+    )
     lgb_recall = compute_recall_at_k(
-        pl.concat(lgb_pred_frames), ground_truth_df, weights=metric_weights, k=top_k_predict
+        pl.concat(lgb_pred_frames),
+        ground_truth_df,
+        weights=metric_weights,
+        k=top_k_predict,
+    )
+    ens_recall = compute_recall_at_k(
+        pl.concat(ens_pred_frames),
+        ground_truth_df,
+        weights=metric_weights,
+        k=top_k_predict,
+    )
+
+    logger.info(
+        "[train] Stage-1  Recall@%d | clicks=%.5f | carts=%.5f | orders=%.5f | OVERALL=%.5f",
+        top_k_predict,
+        s1_recall["clicks"],
+        s1_recall["carts"],
+        s1_recall["orders"],
+        s1_recall["overall"],
     )
     logger.info(
         "[train] LightGBM Recall@%d | clicks=%.5f | carts=%.5f | orders=%.5f | OVERALL=%.5f",
@@ -371,17 +570,9 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
         lgb_recall["orders"],
         lgb_recall["overall"],
     )
-
-    final_recall = lgb_recall
     if xgb_enabled and xgb_pred_frames:
         xgb_recall = compute_recall_at_k(
             pl.concat(xgb_pred_frames),
-            ground_truth_df,
-            weights=metric_weights,
-            k=top_k_predict,
-        )
-        ens_recall = compute_recall_at_k(
-            pl.concat(ens_pred_frames),
             ground_truth_df,
             weights=metric_weights,
             k=top_k_predict,
@@ -394,17 +585,15 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
             xgb_recall["orders"],
             xgb_recall["overall"],
         )
-        logger.info(
-            "[train] ENSEMBLE Recall@%d | clicks=%.5f | carts=%.5f | orders=%.5f | OVERALL=%.5f",
-            top_k_predict,
-            ens_recall["clicks"],
-            ens_recall["carts"],
-            ens_recall["orders"],
-            ens_recall["overall"],
-        )
-        final_recall = ens_recall
+    logger.info(
+        "[train] 3-WAY ENSEMBLE Recall@%d | clicks=%.5f | carts=%.5f | orders=%.5f | OVERALL=%.5f",
+        top_k_predict,
+        ens_recall["clicks"],
+        ens_recall["carts"],
+        ens_recall["orders"],
+        ens_recall["overall"],
+    )
 
-    meta_path = models_dir / "model_meta.json"
     meta_payload = {
         "mode": mode,
         "feature_cols": feature_cols,
@@ -412,7 +601,9 @@ def run_train(config: dict[str, Any], mode: str = "sample") -> None:
         "top_k_predict": top_k_predict,
         "xgb_enabled": xgb_enabled,
         "blend_weights": blend_weights,
-        "validation_recall": final_recall,
+        "validation_recall": ens_recall,
     }
-    meta_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+    tmp_meta = atomic_temp_path(meta_path)
+    tmp_meta.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+    commit_atomic(tmp_meta, meta_path)
     logger.info("[train] Saved model metadata -> %s", meta_path)

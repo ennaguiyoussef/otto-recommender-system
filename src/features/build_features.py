@@ -1,17 +1,22 @@
-"""Session, item, and session-item interaction feature engineering (Stage 2)."""
+"""Session, item, and interaction feature engineering with sharded Drive checkpoints."""
 
 from __future__ import annotations
 
+import gc
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 
+from src.utils.checkpoint import atomic_temp_path, commit_atomic, is_valid_checkpoint
+
 logger = logging.getLogger(__name__)
 
 EVENTS: tuple[str, str, str] = ("clicks", "carts", "orders")
 EVENT_WEIGHTS: dict[int, float] = {0: 1.0, 1: 4.0, 2: 3.0}
+FULL_TEST_SHARDS = 16
 
 
 def _type_flags(frame: pl.LazyFrame) -> list[pl.Expr]:
@@ -34,62 +39,75 @@ def _type_code_expr(frame: pl.LazyFrame) -> pl.Expr:
     )
 
 
-def _build_item_features(item_corpus: pl.LazyFrame) -> pl.LazyFrame:
-    """Aggregate global item popularity, conversion rates, and 7d/2d trend features."""
+def _ensure_item_features_cached(
+    item_corpus: pl.LazyFrame, cache_path: Path, force: bool = False
+) -> pl.LazyFrame:
+    """Materialize item feature lookup table on Drive so shard resumes are instant."""
+    if is_valid_checkpoint(cache_path, force=force):
+        return pl.scan_parquet(cache_path)
+
     max_ts = item_corpus.select(pl.col("ts").max()).collect().item()
     ts_per_sec = 1000 if (max_ts is not None and int(max_ts) > 10_000_000_000) else 1
     recent_7d = (int(max_ts) - 7 * 86_400 * ts_per_sec) if max_ts is not None else 0
     recent_2d = (int(max_ts) - 2 * 86_400 * ts_per_sec) if max_ts is not None else 0
 
-    items = item_corpus.group_by("aid").agg(
-        pl.len().cast(pl.Int32).alias("item_events"),
-        pl.col("session").n_unique().cast(pl.Int32).alias("item_sessions"),
-        *[
-            flag.sum().cast(pl.Int32).alias(f"item_{event}")
-            for event, flag in zip(EVENTS, _type_flags(item_corpus))
-        ],
-        (pl.col("ts") >= recent_7d).sum().cast(pl.Int32).alias("item_recent_7d_events"),
-        (pl.col("ts") >= recent_2d).sum().cast(pl.Int32).alias("item_recent_2d_events"),
-    )
-    items = items.with_columns(
-        pl.when(pl.col("item_clicks") > 0)
-        .then(pl.col("item_carts").cast(pl.Float32) / pl.col("item_clicks").cast(pl.Float32))
-        .otherwise(0.0)
-        .cast(pl.Float32)
-        .alias("item_clicks_to_carts"),
-        pl.when(pl.col("item_carts") > 0)
-        .then(pl.col("item_orders").cast(pl.Float32) / pl.col("item_carts").cast(pl.Float32))
-        .otherwise(0.0)
-        .cast(pl.Float32)
-        .alias("item_carts_to_orders"),
-        (
-            pl.col("item_recent_7d_events").cast(pl.Float32)
-            / (pl.col("item_events").cast(pl.Float32) + 1.0)
+    items = (
+        item_corpus.group_by("aid")
+        .agg(
+            pl.len().cast(pl.Int32).alias("item_events"),
+            pl.col("session").n_unique().cast(pl.Int32).alias("item_sessions"),
+            *[
+                flag.sum().cast(pl.Int32).alias(f"item_{event}")
+                for event, flag in zip(EVENTS, _type_flags(item_corpus))
+            ],
+            (pl.col("ts") >= recent_7d).sum().cast(pl.Int32).alias("item_recent_7d_events"),
+            (pl.col("ts") >= recent_2d).sum().cast(pl.Int32).alias("item_recent_2d_events"),
         )
-        .cast(pl.Float32)
-        .alias("item_recent_share"),
-        (
-            pl.col("item_recent_2d_events").cast(pl.Float32)
-            / (pl.col("item_recent_7d_events").cast(pl.Float32) + 1.0)
+        .with_columns(
+            pl.when(pl.col("item_clicks") > 0)
+            .then(
+                pl.col("item_carts").cast(pl.Float32)
+                / pl.col("item_clicks").cast(pl.Float32)
+            )
+            .otherwise(0.0)
+            .cast(pl.Float32)
+            .alias("item_clicks_to_carts"),
+            pl.when(pl.col("item_carts") > 0)
+            .then(
+                pl.col("item_orders").cast(pl.Float32)
+                / pl.col("item_carts").cast(pl.Float32)
+            )
+            .otherwise(0.0)
+            .cast(pl.Float32)
+            .alias("item_carts_to_orders"),
+            (
+                pl.col("item_recent_7d_events").cast(pl.Float32)
+                / (pl.col("item_events").cast(pl.Float32) + 1.0)
+            )
+            .cast(pl.Float32)
+            .alias("item_recent_share"),
+            (
+                pl.col("item_recent_2d_events").cast(pl.Float32)
+                / (pl.col("item_recent_7d_events").cast(pl.Float32) + 1.0)
+            )
+            .cast(pl.Float32)
+            .alias("item_2d_spike"),
         )
-        .cast(pl.Float32)
-        .alias("item_2d_spike"),
     )
-    return items
+    tmp_it = atomic_temp_path(cache_path)
+    items.sink_parquet(tmp_it)
+    commit_atomic(tmp_it, cache_path)
+    return pl.scan_parquet(cache_path)
 
 
-def _build_feature_table(
-    history_path: Path,
-    candidates_path: Path,
+def _build_feature_lazy(
+    history: pl.LazyFrame,
+    candidates: pl.LazyFrame,
     covis_path: Path,
     items: pl.LazyFrame,
-    out_path: Path,
     labels_path: Path | None = None,
-) -> None:
-    """Build and stream a 40-feature candidate table for validation or test sessions."""
-    history = pl.scan_parquet(history_path)
-    candidates = pl.scan_parquet(candidates_path)
-
+) -> pl.LazyFrame:
+    """Construct the 41-feature LazyFrame for a given (history, candidates) slice."""
     keys = ["session", "aid"]
     ts = pl.col("ts").cast(pl.Int64)
     hist_flags = _type_flags(history)
@@ -280,58 +298,155 @@ def _build_feature_table(
     if labels_path is not None:
         fill_exprs.append(pl.col("^label_.*$").fill_null(0))
 
-    features = features.with_columns(*fill_exprs).drop("session_end", "pair_last_ts")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    features.sink_parquet(out_path)
-    logger.info("[features] Wrote %s", out_path)
+    return features.with_columns(*fill_exprs).drop("session_end", "pair_last_ts")
 
 
 def run_build_features(config: dict[str, Any], mode: str = "sample") -> None:
-    """Construct user/session, item, and interaction features for candidate pairs."""
+    """Construct user/session, item, and interaction features with Drive checkpointing."""
     candidates_dir = config["paths"]["candidates"]
     features_dir = config["paths"]["features"]
-
-    logger.info(
-        "[features] Building reranker feature tables (mode=%s) from '%s' -> '%s'",
-        mode,
-        candidates_dir,
-        features_dir,
-    )
+    raw_dir = Path(config["paths"]["raw_data"])
+    force = bool(config.get("force_recompute", False))
 
     splits = Path(config["paths"]["splits"]) / mode
     retrieval = Path(candidates_dir) / mode
     output = Path(features_dir) / mode
+    output.mkdir(parents=True, exist_ok=True)
 
-    val_item_corpus = pl.concat(
-        [
-            pl.scan_parquet(splits / "train.parquet"),
-            pl.scan_parquet(splits / "history.parquet"),
-        ]
-    )
-    val_items = _build_item_features(val_item_corpus)
+    val_out = output / "features.parquet"
+    val_items_cache = output / "_val_item_features.parquet"
 
-    _build_feature_table(
-        history_path=splits / "history.parquet",
-        candidates_path=retrieval / "candidates.parquet",
-        covis_path=retrieval / "covisitation.parquet",
-        items=val_items,
-        out_path=output / "features.parquet",
-        labels_path=splits / "labels.parquet",
-    )
+    if is_valid_checkpoint(val_out, force=force):
+        logger.info("[checkpoint] Validation features already exist -> %s", val_out)
+    else:
+        logger.info("[features] Building validation features -> '%s'", val_out)
+        val_item_corpus = pl.concat(
+            [
+                pl.scan_parquet(splits / "train.parquet"),
+                pl.scan_parquet(splits / "history.parquet"),
+            ]
+        )
+        val_items = _ensure_item_features_cached(
+            val_item_corpus, val_items_cache, force=force
+        )
+        lf_val = _build_feature_lazy(
+            history=pl.scan_parquet(splits / "history.parquet"),
+            candidates=pl.scan_parquet(retrieval / "candidates.parquet"),
+            covis_path=retrieval / "covisitation.parquet",
+            items=val_items,
+            labels_path=splits / "labels.parquet",
+        )
+        tmp_val = atomic_temp_path(val_out)
+        lf_val.sink_parquet(tmp_val)
+        commit_atomic(tmp_val, val_out)
+        logger.info("[features] Wrote %s", val_out)
 
     test_history_path = splits / "test_history.parquet"
     test_cands_path = retrieval / "test_candidates.parquet"
-    if test_history_path.exists() and test_cands_path.exists():
+    if not (test_history_path.exists() and test_cands_path.exists()):
+        return
+
+    if mode == "sample":
+        test_out = output / "test_features.parquet"
+        if is_valid_checkpoint(test_out, force=force):
+            logger.info("[checkpoint] Test features already exist -> %s", test_out)
+            return
+
         test_item_corpus = pl.concat(
-            [val_item_corpus, pl.scan_parquet(test_history_path)]
+            [
+                pl.scan_parquet(splits / "train.parquet"),
+                pl.scan_parquet(splits / "history.parquet"),
+                pl.scan_parquet(test_history_path),
+            ]
         )
-        test_items = _build_item_features(test_item_corpus)
-        _build_feature_table(
-            history_path=test_history_path,
-            candidates_path=test_cands_path,
+        test_items = _ensure_item_features_cached(
+            test_item_corpus, output / "_test_item_features.parquet", force=force
+        )
+        lf_test = _build_feature_lazy(
+            history=pl.scan_parquet(test_history_path),
+            candidates=pl.scan_parquet(test_cands_path),
             covis_path=retrieval / "covisitation.parquet",
             items=test_items,
-            out_path=output / "test_features.parquet",
             labels_path=None,
         )
+        tmp_test = atomic_temp_path(test_out)
+        lf_test.sink_parquet(tmp_test)
+        commit_atomic(tmp_test, test_out)
+        logger.info("[features] Wrote %s", test_out)
+    else:
+        # Full mode: shard 1.67M test sessions into 16 bounded, individually checkpointed shards!
+        shards_dir = output / "test_features_shards"
+        complete_flag = shards_dir / "_COMPLETE.flag"
+        if force and shards_dir.exists():
+            shutil.rmtree(shards_dir, ignore_errors=True)
+        shards_dir.mkdir(parents=True, exist_ok=True)
+
+        if not force and complete_flag.exists():
+            logger.info(
+                "[checkpoint] All %d full test feature shards already exist in '%s'; skipping.",
+                FULL_TEST_SHARDS,
+                shards_dir,
+            )
+            return
+
+        raw_train_files = [
+            p
+            for p in sorted(raw_dir.rglob("*.parquet"))
+            if "train" in p.name.lower() or "train" in p.parent.name.lower()
+        ]
+        if raw_train_files:
+            raw_lf = pl.scan_parquet(raw_train_files).select(
+                pl.col("session").cast(pl.Int32).alias("session"),
+                pl.col("aid").cast(pl.Int32).alias("aid"),
+                pl.col("ts").cast(pl.Int64).alias("ts"),
+                _type_code_expr(pl.scan_parquet(raw_train_files))
+                .cast(pl.UInt8)
+                .alias("type"),
+            )
+            test_item_corpus = pl.concat([raw_lf, pl.scan_parquet(test_history_path)])
+        else:
+            test_item_corpus = pl.concat(
+                [
+                    pl.scan_parquet(splits / "train.parquet"),
+                    pl.scan_parquet(splits / "history.parquet"),
+                    pl.scan_parquet(test_history_path),
+                ]
+            )
+
+        test_items = _ensure_item_features_cached(
+            test_item_corpus, output / "_test_item_features.parquet", force=force
+        )
+
+        for shard_id in range(FULL_TEST_SHARDS):
+            shard_path = shards_dir / f"shard_{shard_id:02d}.parquet"
+            if is_valid_checkpoint(shard_path, force=False):
+                logger.info(
+                    "[checkpoint] Test feature shard %d/%d already exists; skipping.",
+                    shard_id + 1,
+                    FULL_TEST_SHARDS,
+                )
+                continue
+
+            shard_filter = (
+                pl.col("session").hash(seed=99) % FULL_TEST_SHARDS
+            ) == shard_id
+            lf_shard = _build_feature_lazy(
+                history=pl.scan_parquet(test_history_path).filter(shard_filter),
+                candidates=pl.scan_parquet(test_cands_path).filter(shard_filter),
+                covis_path=retrieval / "covisitation.parquet",
+                items=test_items,
+                labels_path=None,
+            )
+            tmp_s = atomic_temp_path(shard_path)
+            lf_shard.sink_parquet(tmp_s)
+            commit_atomic(tmp_s, shard_path)
+            gc.collect()
+            logger.info(
+                "[features] Checkpointed test feature shard %d/%d -> %s",
+                shard_id + 1,
+                FULL_TEST_SHARDS,
+                shard_path,
+            )
+
+        complete_flag.write_text("ok", encoding="utf-8")
+        logger.info("[features] Completed all %d test feature shards.", FULL_TEST_SHARDS)
