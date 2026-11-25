@@ -17,27 +17,36 @@ TYPE_TO_CODE: dict[str, int] = {
 }
 
 
-def _discover_split_files(source_dir: Path) -> tuple[list[Path], list[Path]]:
-    """Locate train and test Parquet files inside source_dir."""
+def _discover_train_files(source_dir: Path) -> list[Path]:
+    """Locate train Parquet file(s) inside source_dir."""
     all_parquets = sorted(source_dir.rglob("*.parquet"))
     if not all_parquets:
         raise FileNotFoundError(f"No Parquet files found in '{source_dir}'.")
 
     train_files = [
-        p for p in all_parquets if "train" in p.name.lower() or "train" in p.parent.name.lower()
+        p
+        for p in all_parquets
+        if "train" in p.name.lower() or "train" in p.parent.name.lower()
     ]
-    test_files = [
-        p for p in all_parquets if "test" in p.name.lower() or "test" in p.parent.name.lower()
-    ]
-
     if not train_files:
-        # Fallback if a single unnamed parquet was supplied
+        test_files = _discover_test_files(source_dir)
         train_files = [p for p in all_parquets if p not in test_files]
     if not train_files:
         raise FileNotFoundError(
             f"Could not identify train Parquet file(s) inside '{source_dir}'."
         )
-    return train_files, test_files
+    return train_files
+
+
+def _discover_test_files(source_dir: Path) -> list[Path]:
+    """Locate test Parquet file(s) inside source_dir (returns empty list if absent)."""
+    if not source_dir.exists():
+        return []
+    return [
+        p
+        for p in sorted(source_dir.rglob("*.parquet"))
+        if "test" in p.name.lower() or "test" in p.parent.name.lower()
+    ]
 
 
 def _normalize_events(files: list[Path]) -> pl.LazyFrame:
@@ -60,6 +69,14 @@ def _normalize_events(files: list[Path]) -> pl.LazyFrame:
         pl.col("ts").cast(pl.Int64).alias("ts"),
         type_expr.alias("type"),
     )
+
+
+def _session_sample_expr(frac: float, seed: int) -> pl.Expr:
+    """Deterministic 64-bit hash filter over `session`."""
+    if frac >= 1.0:
+        return pl.lit(True)
+    threshold = pl.lit(int(frac * (1 << 64)), dtype=pl.UInt64)
+    return pl.col("session").hash(seed=seed) < threshold
 
 
 def _extract_ground_truth_labels(suffix_events: pl.LazyFrame) -> pl.LazyFrame:
@@ -92,35 +109,51 @@ def _extract_ground_truth_labels(suffix_events: pl.LazyFrame) -> pl.LazyFrame:
 def run_split(config: dict[str, Any], mode: str = "sample") -> None:
     """Generate leak-free temporal train/validation splits and ground-truth labels.
 
-    Outputs written to `<splits>/<mode>/`:
-      - `train.parquet`: Historical events strictly before the validation cutoff.
-      - `history.parquet`: Observed prefixes of validation sessions.
-      - `labels.parquet`: Held-out ground-truth targets `(session, aid, type)`.
-      - `test_history.parquet`: Standardized Kaggle test events (when test Parquet exists).
+    In `sample` mode with `history_corpus_frac: 1.0`, 100% of historical `train`
+    events (`ts < cutoff_ts`) are preserved so the 1.85M-item co-visitation graph
+    has full density, while validation and test query sessions are subsampled at
+    `sample_frac` (5%) for rapid, representative local Recall@20 evaluation.
 
     Args:
         config: Loaded pipeline configuration with resolved Drive paths.
         mode: Execution mode ('sample' or 'full').
     """
-    source_dir = Path(
-        config["paths"]["sample_data"]
-        if mode == "sample"
-        else config["paths"]["raw_data"]
-    )
+    raw_dir = Path(config["paths"]["raw_data"])
+    sample_dir = Path(config["paths"]["sample_data"])
     out_dir = Path(config["paths"]["splits"]) / mode
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    mode_cfg = config.get("modes", {}).get(mode, {})
+    history_corpus_frac = float(mode_cfg.get("history_corpus_frac", 1.0))
+    sample_frac = float(config["sample_frac"])
     val_days = int(config["pipeline"]["validation_days"])
+    max_val_sessions = int(config["pipeline"].get("max_val_sessions", 350_000))
     seed = int(config["pipeline"]["seed"])
 
+    # Prefer raw_data when keeping 100% historical item graph in sample mode
+    use_raw_for_history = (
+        mode == "full"
+        or (history_corpus_frac >= 1.0 and any(raw_dir.rglob("*.parquet")))
+    )
+    train_source_dir = raw_dir if use_raw_for_history else sample_dir
+    test_source_dir = (
+        sample_dir
+        if (mode == "sample" and any(sample_dir.rglob("*test*.parquet")))
+        else train_source_dir
+    )
+
     logger.info(
-        "[split] Splitting sessions (%d-day validation window) from '%s' -> '%s'",
+        "[split] Splitting sessions (mode=%s, val_days=%d, query_frac=%.2f, corpus_frac=%.2f) from '%s' -> '%s'",
+        mode,
         val_days,
-        source_dir,
+        sample_frac,
+        history_corpus_frac,
+        train_source_dir,
         out_dir,
     )
 
-    train_files, test_files = _discover_split_files(source_dir)
+    train_files = _discover_train_files(train_source_dir)
+    test_files = _discover_test_files(test_source_dir)
     events = _normalize_events(train_files)
 
     ts_stats = events.select(
@@ -130,15 +163,13 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
     min_ts = int(ts_stats["min_ts"][0])
     max_ts = int(ts_stats["max_ts"][0])
 
-    # Auto-detect milliseconds vs seconds (radek1 dataset stores seconds as Int32)
     ts_per_sec = 1000 if max_ts > 10_000_000_000 else 1
     val_window = val_days * 86_400 * ts_per_sec
-
-    if (max_ts - min_ts) > val_window:
-        cutoff_ts = max_ts - val_window
-    else:
-        # Fallback for short synthetic/test spans: split on upper 25% of timeline
-        cutoff_ts = min_ts + int((max_ts - min_ts) * 0.75)
+    cutoff_ts = (
+        max_ts - val_window
+        if (max_ts - min_ts) > val_window
+        else min_ts + int((max_ts - min_ts) * 0.75)
+    )
 
     logger.info(
         "[split] Timeline [%d .. %d] (scale=%ds) -> cutoff_ts=%d",
@@ -152,12 +183,53 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
     history_path = out_dir / "history.parquet"
     labels_path = out_dir / "labels.parquet"
 
-    # 1. Historical training events before the validation window
-    events.filter(pl.col("ts") < cutoff_ts).sink_parquet(train_path)
+    # 1. Historical corpus strictly before validation cutoff (zero future leakage)
+    hist_corpus = events.filter(pl.col("ts") < cutoff_ts)
+    if history_corpus_frac < 1.0 and use_raw_for_history:
+        hist_corpus = hist_corpus.filter(_session_sample_expr(history_corpus_frac, seed))
+    hist_corpus.sink_parquet(train_path)
 
-    # 2. Validation sessions: sessions active in [cutoff_ts, max_ts] with >= 2 events
+    # 2. Validation sessions: strictly starting in [cutoff_ts, max_ts] when available
+    strict_val_sessions = (
+        events.group_by("session")
+        .agg(
+            pl.col("ts").min().alias("_s_min"),
+            pl.len().alias("_s_len"),
+        )
+        .filter((pl.col("_s_min") >= cutoff_ts) & (pl.col("_s_len") >= 2))
+        .select("session")
+    )
+
+    if use_raw_for_history and sample_frac < 1.0:
+        strict_val_sessions = strict_val_sessions.filter(
+            _session_sample_expr(sample_frac, seed)
+        )
+
+    selected_val_sessions = strict_val_sessions.collect()
+    if len(selected_val_sessions) == 0:
+        # Fallback for synthetic datasets where sessions span across cutoff_ts
+        selected_val_sessions = (
+            events.filter(pl.col("ts") >= cutoff_ts)
+            .group_by("session")
+            .len()
+            .filter(pl.col("len") >= 2)
+            .select("session")
+            .collect()
+        )
+
+    if len(selected_val_sessions) > max_val_sessions:
+        selected_val_sessions = selected_val_sessions.sample(
+            n=max_val_sessions, seed=seed
+        )
+
+    logger.info(
+        "[split] Selected %d validation sessions for history/label truncation.",
+        len(selected_val_sessions),
+    )
+
     val_events = (
         events.filter(pl.col("ts") >= cutoff_ts)
+        .join(selected_val_sessions.lazy(), on="session", how="semi")
         .sort(["session", "ts"])
         .with_columns(
             pl.len().over("session").alias("_sess_len"),
@@ -184,15 +256,18 @@ def run_split(config: dict[str, Any], mode: str = "sample") -> None:
     )
     _extract_ground_truth_labels(suffix_events).sink_parquet(labels_path)
 
-    # 3. Kaggle test events (if test.parquet is present)
+    # 3. Kaggle test events
     if test_files:
         test_out = out_dir / "test_history.parquet"
-        _normalize_events(test_files).sort(["session", "ts"]).sink_parquet(test_out)
+        test_lf = _normalize_events(test_files)
+        if mode == "sample" and test_source_dir == raw_dir and sample_frac < 1.0:
+            test_lf = test_lf.filter(_session_sample_expr(sample_frac, seed))
+        test_lf.sort(["session", "ts"]).sink_parquet(test_out)
         logger.info("[split] Wrote standardized test history -> %s", test_out)
     else:
-        logger.warning("[split] No test Parquet found in '%s'; skipping test_history.parquet.", source_dir)
+        logger.warning(
+            "[split] No test Parquet found in '%s'; skipping test_history.parquet.",
+            test_source_dir,
+        )
 
-    logger.info(
-        "[split] Completed splits in '%s' (train, history, labels).",
-        out_dir,
-    )
+    logger.info("[split] Completed splits in '%s'.", out_dir)

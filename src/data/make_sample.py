@@ -27,10 +27,14 @@ def run_make_sample(config: dict[str, Any], mode: str = "sample") -> None:
     raw_dir = Path(config["paths"]["raw_data"])
     sample_dir = Path(config["paths"]["sample_data"])
     sample_frac = config["sample_frac"]
+    history_corpus_frac = float(
+        config.get("modes", {}).get(mode, {}).get("history_corpus_frac", 1.0)
+    )
 
     logger.info(
-        "[sample] Preparing %.1f%% session sample from '%s' -> '%s'",
+        "[sample] Preparing %.1f%% session sample (history_corpus_frac=%.2f) from '%s' -> '%s'",
         sample_frac * 100,
+        history_corpus_frac,
         raw_dir,
         sample_dir,
     )
@@ -40,6 +44,12 @@ def run_make_sample(config: dict[str, Any], mode: str = "sample") -> None:
     sources = sorted(raw_dir.rglob("*.parquet"))
     if not sources:
         raise FileNotFoundError(f"No Parquet files found in {raw_dir}")
+
+    # When history_corpus_frac >= 1.0, split.py reads full historical train directly from raw_data
+    if history_corpus_frac >= 1.0:
+        test_sources = [p for p in sources if "test" in p.name.lower() or "test" in p.parent.name.lower()]
+        if test_sources:
+            sources = test_sources
 
     # A shared hash threshold keeps every occurrence of a session across files.
     seed = config["pipeline"]["seed"]
